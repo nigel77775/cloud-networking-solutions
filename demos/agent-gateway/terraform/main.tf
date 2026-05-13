@@ -515,6 +515,14 @@ resource "google_project_iam_member" "discoveryengine_admin" {
   member   = each.key
 }
 
+# Cloud Run Admin — Allow platform admins to manage Cloud Run services
+resource "google_project_iam_member" "run_admin" {
+  for_each = toset(var.platform_admin_members)
+  project  = var.project_id
+  role     = "roles/run.admin"
+  member   = each.key
+}
+
 # Phase 15: Agent Registry Endpoints — governance plane fronting the Google API
 # services AND the MCP Cloud Run services. Registers all regional, mTLS, and REP
 # variants of the specified Google APIs, plus one entry per MCP Cloud Run service
