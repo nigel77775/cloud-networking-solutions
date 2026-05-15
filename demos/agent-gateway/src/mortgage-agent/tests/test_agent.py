@@ -72,29 +72,70 @@ class TestFindHttpStatusError:
         assert _find_http_status_error(outer_group, 403) is True
 
 
+def _make_tool_context(state: dict | None = None) -> MagicMock:
+    """ToolContext mock whose `.state` is a real dict so .get/__setitem__ work."""
+    ctx = MagicMock()
+    ctx.state = {} if state is None else state
+    return ctx
+
+
 class TestHandleToolError:
     def test_403_returns_friendly_message(self):
         tool = MagicMock()
         tool.name = "send_email"
         error = _make_http_status_error(403)
-        result = _handle_tool_error(tool, {}, MagicMock(), error)
+        result = _handle_tool_error(tool, {}, _make_tool_context(), error)
         assert result is not None
         assert "denied" in result["error"]
         assert "send_email" in result["error"]
+        # First attempt should not be the hard-stop wording.
+        assert "Do not call this tool again" not in result["error"]
 
     def test_non_403_returns_none(self):
         tool = MagicMock()
         tool.name = "read_email"
         error = _make_http_status_error(500)
-        result = _handle_tool_error(tool, {}, MagicMock(), error)
+        result = _handle_tool_error(tool, {}, _make_tool_context(), error)
         assert result is None
 
     def test_non_http_error_returns_none(self):
         tool = MagicMock()
         tool.name = "read_email"
         error = RuntimeError("something broke")
-        result = _handle_tool_error(tool, {}, MagicMock(), error)
+        result = _handle_tool_error(tool, {}, _make_tool_context(), error)
         assert result is None
+
+    def test_403_second_attempt_returns_hard_stop(self):
+        tool = MagicMock()
+        tool.name = "send_email"
+        error = _make_http_status_error(403)
+        ctx = _make_tool_context()
+
+        first = _handle_tool_error(tool, {}, ctx, error)
+        assert "Do not call this tool again" not in first["error"]
+
+        second = _handle_tool_error(tool, {}, ctx, error)
+        assert "Do not call this tool again" in second["error"]
+        assert ctx.state["_denied_mcp_tools"]["send_email"] == 2
+
+    def test_403_per_tool_counters_are_independent(self):
+        tool_a = MagicMock()
+        tool_a.name = "send_email"
+        tool_b = MagicMock()
+        tool_b.name = "read_email"
+        error = _make_http_status_error(403)
+        ctx = _make_tool_context()
+
+        # Tool A hits the cap.
+        _handle_tool_error(tool_a, {}, ctx, error)
+        _handle_tool_error(tool_a, {}, ctx, error)
+        assert ctx.state["_denied_mcp_tools"]["send_email"] == 2
+
+        # Tool B's first attempt is still the friendly (non-hard-stop) message.
+        result = _handle_tool_error(tool_b, {}, ctx, error)
+        assert "Do not call this tool again" not in result["error"]
+        assert "denied" in result["error"]
+        assert ctx.state["_denied_mcp_tools"]["read_email"] == 1
 
 
 class TestInstructionRendering:
@@ -150,18 +191,17 @@ class TestInstructionRendering:
         assert "`income_*`" not in instruction
 
 
-class TestConnectionTimeoutOverride:
-    """ADK's 5s default trips on Cloud Run cold starts; we override it to 30s."""
+class TestConnectionTimeoutNoMutation:
+    """We rely on ADK's 5s default for fail-fast on denied calls; do not mutate it."""
 
-    def test_discover_overrides_toolset_timeout(self, monkeypatch):
+    def test_discover_does_not_override_toolset_timeout(self, monkeypatch):
         monkeypatch.setenv("MCP_REGISTRY_PROJECT", "test-project")
         monkeypatch.setenv("MCP_REGISTRY_LOCATION", "us-central1")
         monkeypatch.delenv("MCP_REGISTRY_FILTER", raising=False)
         monkeypatch.delenv("MCP_REGISTRY_ENDPOINT", raising=False)
 
-        # Connection params object whose timeout we expect to be mutated.
         conn_params = MagicMock()
-        conn_params.timeout = 5.0
+        conn_params.timeout = 5.0  # ADK default
         conn_params.url = "https://x.example/mcp"
 
         toolset = MagicMock()
@@ -181,4 +221,4 @@ class TestConnectionTimeoutOverride:
             result = _discover_mcp_toolsets()
 
         assert result == [toolset]
-        assert conn_params.timeout == 30.0
+        assert conn_params.timeout == 5.0
