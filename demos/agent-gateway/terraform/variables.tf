@@ -503,14 +503,14 @@ variable "agent_registry_custom_services" {
 # ==============================================================================
 
 variable "logging_data_access" {
-  description = "Data access audit log configuration passed to the foundation module. Defaults to ADMIN_READ + DATA_READ + DATA_WRITE for iap.googleapis.com."
+  description = "Data access audit log configuration passed to the foundation module. Defaults to ADMIN_READ + DATA_READ + DATA_WRITE for the special 'allServices' key (project-wide audit logging across every API). Override per-service to scope down or to exempt members."
   type = map(object({
     ADMIN_READ = optional(object({ exempted_members = optional(list(string), []) }))
     DATA_READ  = optional(object({ exempted_members = optional(list(string), []) }))
     DATA_WRITE = optional(object({ exempted_members = optional(list(string), []) }))
   }))
   default = {
-    "iap.googleapis.com" = {
+    "allServices" = {
       ADMIN_READ = {}
       DATA_READ  = {}
       DATA_WRITE = {}
