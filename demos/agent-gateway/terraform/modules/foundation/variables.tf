@@ -103,14 +103,14 @@ variable "enable_psc_interface" {
 }
 
 variable "logging_data_access" {
-  description = "Data access audit log configuration. Map of service name to a map of log type (ADMIN_READ|DATA_READ|DATA_WRITE) to optional exempted_members."
+  description = "Data access audit log configuration. Map of service name to a map of log type (ADMIN_READ|DATA_READ|DATA_WRITE) to optional exempted_members. Use the special 'allServices' key to apply project-wide across every API."
   type = map(object({
     ADMIN_READ = optional(object({ exempted_members = optional(list(string), []) }))
     DATA_READ  = optional(object({ exempted_members = optional(list(string), []) }))
     DATA_WRITE = optional(object({ exempted_members = optional(list(string), []) }))
   }))
   default = {
-    "iap.googleapis.com" = {
+    "allServices" = {
       ADMIN_READ = {}
       DATA_READ  = {}
       DATA_WRITE = {}

@@ -74,6 +74,16 @@ module "foundation" {
   logging_data_access  = var.logging_data_access
 }
 
+# Phase 1.5: Observability - Log Analytics on _Default + authorization
+# debugging dashboard.
+module "observability" {
+  source = "./modules/observability"
+
+  project_id = var.project_id
+
+  depends_on = [module.foundation]
+}
+
 # Phase 2: Networking - VPC, Subnets, NAT, Static IPs, private DNS zones
 module "networking" {
   source = "./modules/networking"
