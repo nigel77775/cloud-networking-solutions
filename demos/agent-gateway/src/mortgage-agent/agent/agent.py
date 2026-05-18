@@ -123,7 +123,7 @@ def _build_impersonation_factory(target_url: str, target_sa_email: str):
         return httpx.AsyncClient(
             follow_redirects=True,
             headers=headers,
-            timeout=timeout if timeout is not None else httpx.Timeout(30.0, read=300.0),
+            timeout=timeout if timeout is not None else httpx.Timeout(5.0),
             # Honor an explicit auth from the caller (rare); otherwise inject ours.
             auth=auth if auth is not None else auth_handler,
         )
@@ -224,19 +224,47 @@ def _find_http_status_error(exc: BaseException, status_code: int) -> bool:
     return False
 
 
+# Session-scoped key under which we count per-tool 403 attempts. Without this
+# the LLM will happily re-call a denied tool on every turn, multiplying the
+# authz extension's per-call budget into a multi-second loop.
+_DENIED_TOOLS_STATE_KEY = "_denied_mcp_tools"
+_MAX_403_ATTEMPTS = 2  # initial attempt + 1 retry
+
+
 def _handle_tool_error(
     tool: BaseTool, args: dict[str, Any], tool_context: ToolContext, error: Exception
 ) -> dict | None:
-    """Handle tool errors, returning a friendly message for 403 policy denials."""
-    if _find_http_status_error(error, 403):
-        logger.warning("Tool %s denied by authorization policy (403)", tool.name)
+    """Handle tool errors, returning a friendly message for 403 policy denials.
+
+    Tracks 403 count per tool name in `tool_context.state` so the LLM is told to
+    stop after _MAX_403_ATTEMPTS denials for the same tool within a session.
+    """
+    if not _find_http_status_error(error, 403):
+        return None
+    denied = dict(tool_context.state.get(_DENIED_TOOLS_STATE_KEY, {}))
+    attempts = denied.get(tool.name, 0) + 1
+    denied[tool.name] = attempts
+    tool_context.state[_DENIED_TOOLS_STATE_KEY] = denied
+    logger.warning(
+        "Tool %s denied by authorization policy (403) — attempt %d/%d",
+        tool.name,
+        attempts,
+        _MAX_403_ATTEMPTS,
+    )
+    if attempts >= _MAX_403_ATTEMPTS:
         return {
             "error": (
-                f"The '{tool.name}' tool call was denied by the authorization "
-                "gateway. This operation is not permitted by policy."
+                f"The '{tool.name}' tool was denied by the authorization gateway "
+                f"{attempts} times. Do not call this tool again in this session — "
+                "report the denial to the user and proceed with other tools."
             ),
         }
-    return None
+    return {
+        "error": (
+            f"The '{tool.name}' tool call was denied by the authorization "
+            "gateway. This operation is not permitted by policy."
+        ),
+    }
 
 
 def _discover_mcp_toolsets() -> list:
@@ -352,12 +380,11 @@ def _discover_mcp_toolsets() -> list:
         except Exception:
             logger.exception("Failed to build toolset for MCP server %s", name)
             continue
-        # ADK's StreamableHTTPConnectionParams default is 5s, which is shorter
-        # than a Cloud Run cold start when min_instance_count=0. Survive a
-        # restart/scale-out even when an instance happens to be cold.
+        # Use ADK's 5s StreamableHTTPConnectionParams default so denied calls
+        # fail fast. Cold-start tolerance is handled by keeping >=1 warm
+        # instance per MCP backend (terraform/example.tfvars), not by stretching
+        # the per-call budget.
         conn_params = getattr(toolset, "_connection_params", None)
-        if conn_params is not None and hasattr(conn_params, "timeout"):
-            conn_params.timeout = 30.0
         resolved_url = getattr(conn_params, "url", None)
         # Inject SA-impersonation auth so each MCP HTTP call carries an OIDC
         # ID token for the invoker SA. Cloud Run validates the token and sees
