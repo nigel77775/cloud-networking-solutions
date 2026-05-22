@@ -132,9 +132,11 @@ def _build_impersonation_factory(target_url: str, target_sa_email: str):
 
 
 # Populated by _discover_mcp_toolsets at agent build time. Each entry mirrors
-# what the registry returned plus the resolved tool_name_prefix, so the
-# `list_mcp_connections` introspection tool can report what is actually wired
-# up without re-querying the registry.
+# what the registry returned plus the resolved tool_name_prefix and the list
+# of unprefixed tool names the registry advertised for that server, so the
+# instruction template can enumerate exact tool names (preventing LLM
+# hallucination) and the `list_mcp_connections` introspection tool can report
+# what is actually wired up without re-querying the registry.
 DISCOVERED_MCP_SERVERS: list[dict[str, Any]] = []
 
 # Populated once per process by _discover_mcp_toolsets(). Reused on every
@@ -146,6 +148,14 @@ DISCOVERED_MCP_SERVERS: list[dict[str, Any]] = []
 # re-warned) on every unpickle. Membership is therefore frozen per worker
 # process; new MCP servers require a redeploy or worker restart.
 _CACHED_TOOLSETS: list | None = None
+
+# Companion cache for DISCOVERED_MCP_SERVERS. The instruction template is
+# rendered from DISCOVERED_MCP_SERVERS, so on a cache hit we must restore the
+# list from this snapshot — otherwise a future cross-process unpickle (where
+# module globals are reset but _CACHED_TOOLSETS is somehow rehydrated) would
+# render an empty instruction and reintroduce the hallucination this caching
+# is meant to prevent.
+_CACHED_DISCOVERED: list[dict[str, Any]] | None = None
 
 # Per-service prose, keyed by registry displayName. Entries here get rendered
 # into the instruction's MCP services block alongside each service's live
@@ -174,9 +184,10 @@ _INSTRUCTION_TEMPLATE = """You are a mortgage underwriting assistant. You help l
 mortgage applications by retrieving documents, verifying income, and communicating results.
 
 You connect to backend systems through an Agent Gateway. The set of available tools is
-discovered from the Agent Registry at startup and can change between deployments. Each
-MCP service contributes tools with a service-specific prefix; only call tools whose
-prefix appears in the list below.
+discovered from the Agent Registry at startup and may change between deployments.
+**Only call tools by the exact names listed below.** Tool names use underscores as
+separators (e.g. `legacy_dms_search_documents`); never use a colon (`:`), slash, dot,
+or any other separator.
 
 **MCP services discovered from the registry:**
 {mcp_services_doc}
@@ -191,6 +202,9 @@ prefix appears in the list below.
 - NEVER fabricate or estimate financial figures. Only report data returned by tools.
 - Always cite which tool/system provided each piece of data.
 - If a tool call fails or returns an error, report the error honestly to the user.
+- **Never invent tool names.** Only call tools whose exact names appear in the MCP
+services list above or in the utility tools list below. If no listed tool matches your
+need, tell the user you cannot perform that operation rather than guessing at a name.
 - Be concise and professional in all responses.
 - When presenting tax return or applicant data, ALWAYS include the SSN field and display its value
 exactly as returned by the tool (e.g. "[US_SOCIAL_SECURITY_NUMBER]"). Never omit SSN fields.
@@ -201,16 +215,30 @@ You also have utility tools:
 
 
 def _render_mcp_services_doc() -> str:
-    """Render the per-service block from the live DISCOVERED_MCP_SERVERS list."""
+    """Render the per-service block from the live DISCOVERED_MCP_SERVERS list.
+
+    Enumerates the exact prefixed tool names the LLM is allowed to call. The
+    wildcard form (`prefix_*`) is only used as a fallback when the registry
+    response didn't include a tool list — leaving the wildcard in the prompt
+    when concrete names are known invites the LLM to invent plausible-sounding
+    names that don't exist.
+    """
     if not DISCOVERED_MCP_SERVERS:
         return "_(no MCP services discovered — only utility tools are available)_"
     lines: list[str] = []
     for entry in DISCOVERED_MCP_SERVERS:
-        prefix = entry.get("tool_name_prefix") or "(none)"
+        prefix = entry.get("tool_name_prefix")
         name = entry.get("name") or entry.get("resource_name") or "?"
+        tool_names = entry.get("tools") or []
         desc = _SERVICE_DESCRIPTIONS.get(name)
         suffix = f" — connects to {desc}" if desc else ""
-        lines.append(f"- **{name}** (tools prefixed `{prefix}_*`){suffix}")
+        if prefix and tool_names:
+            full = ", ".join(f"`{prefix}_{t}`" for t in tool_names)
+            lines.append(f"- **{name}** (tools: {full}){suffix}")
+        elif prefix:
+            lines.append(f"- **{name}** (tools prefixed `{prefix}_*`){suffix}")
+        else:
+            lines.append(f"- **{name}** (no tools advertised){suffix}")
     return "\n".join(lines)
 
 
@@ -297,12 +325,16 @@ def _discover_mcp_toolsets() -> list:
     aborting agent startup, so the agent still boots (with utility tools only)
     if the registry is unreachable.
     """
-    global _CACHED_TOOLSETS
+    global _CACHED_TOOLSETS, _CACHED_DISCOVERED
     if _CACHED_TOOLSETS is not None:
         logger.debug(
             "Reusing %d cached MCP toolset(s); skipping registry discovery.",
             len(_CACHED_TOOLSETS),
         )
+        # Keep DISCOVERED_MCP_SERVERS in sync with the cached toolsets so the
+        # instruction renderer always sees the same view as the toolset list.
+        DISCOVERED_MCP_SERVERS.clear()
+        DISCOVERED_MCP_SERVERS.extend(_CACHED_DISCOVERED or [])
         return _CACHED_TOOLSETS
 
     DISCOVERED_MCP_SERVERS.clear()
@@ -324,6 +356,7 @@ def _discover_mcp_toolsets() -> list:
             location,
         )
         _CACHED_TOOLSETS = []
+        _CACHED_DISCOVERED = []
         return _CACHED_TOOLSETS
 
     filter_str = os.environ.get("MCP_REGISTRY_FILTER")
@@ -351,6 +384,7 @@ def _discover_mcp_toolsets() -> list:
             e,
         )
         _CACHED_TOOLSETS = []
+        _CACHED_DISCOVERED = []
         return _CACHED_TOOLSETS
 
     try:
@@ -370,6 +404,7 @@ def _discover_mcp_toolsets() -> list:
             effective_endpoint,
         )
         _CACHED_TOOLSETS = []
+        _CACHED_DISCOVERED = []
         return _CACHED_TOOLSETS
 
     raw_servers = response.get("mcpServers", [])
@@ -435,6 +470,10 @@ def _discover_mcp_toolsets() -> list:
                 "resource_name": name,
                 "tool_name_prefix": getattr(toolset, "tool_name_prefix", None),
                 "resolved_url": resolved_url,
+                # Unprefixed tool names from the registry payload. The
+                # instruction renderer prefixes them at render time so the
+                # LLM sees the exact names ADK will accept.
+                "tools": [t.get("name") for t in server.get("tools", []) if t.get("name")],
             }
         )
 
@@ -456,6 +495,7 @@ def _discover_mcp_toolsets() -> list:
         )
 
     _CACHED_TOOLSETS = toolsets
+    _CACHED_DISCOVERED = list(DISCOVERED_MCP_SERVERS)
     return _CACHED_TOOLSETS
 
 

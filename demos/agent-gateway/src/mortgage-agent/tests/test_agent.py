@@ -139,20 +139,41 @@ class TestHandleToolError:
 
 
 class TestInstructionRendering:
-    """The instruction must reflect the live registry prefixes, not hardcoded ones."""
+    """The instruction must enumerate live registry tool names, not just prefixes,
+    so the LLM has no room to invent plausible-but-wrong tool names."""
 
     _DISCOVERED = [
-        {"name": "legacy-dms", "tool_name_prefix": "legacy_dms"},
-        {"name": "corporate-email", "tool_name_prefix": "corporate_email"},
-        {"name": "income-verification", "tool_name_prefix": "income_verification"},
+        {
+            "name": "legacy-dms",
+            "tool_name_prefix": "legacy_dms",
+            "tools": ["search_documents", "get_document"],
+        },
+        {
+            "name": "corporate-email",
+            "tool_name_prefix": "corporate_email",
+            "tools": ["list_messages", "get_message"],
+        },
+        {
+            "name": "income-verification",
+            "tool_name_prefix": "income_verification",
+            "tools": ["verify_income"],
+        },
     ]
 
-    def test_render_includes_live_prefixes_and_descriptions(self):
+    def test_render_includes_live_tool_names_and_descriptions(self):
         with patch.object(agent_module, "DISCOVERED_MCP_SERVERS", self._DISCOVERED):
             doc = _render_mcp_services_doc()
-        assert "`legacy_dms_*`" in doc
-        assert "`corporate_email_*`" in doc
-        assert "`income_verification_*`" in doc
+        # Concrete prefixed names appear.
+        assert "`legacy_dms_search_documents`" in doc
+        assert "`legacy_dms_get_document`" in doc
+        assert "`corporate_email_list_messages`" in doc
+        assert "`corporate_email_get_message`" in doc
+        assert "`income_verification_verify_income`" in doc
+        # The wildcard form must NOT appear when tools are known — that
+        # wildcard is what gave the LLM rope to invent names.
+        assert "`legacy_dms_*`" not in doc
+        assert "`corporate_email_*`" not in doc
+        assert "`income_verification_*`" not in doc
         # Descriptions for known services come through.
         assert "legacy document management system" in doc
         assert "corporate communications system" in doc
@@ -163,7 +184,35 @@ class TestInstructionRendering:
             doc = _render_mcp_services_doc()
         assert "no MCP services discovered" in doc
 
-    def test_render_handles_unknown_service(self):
+    def test_render_handles_unknown_service_with_tools(self):
+        with patch.object(
+            agent_module,
+            "DISCOVERED_MCP_SERVERS",
+            [
+                {
+                    "name": "future-service",
+                    "tool_name_prefix": "future_service",
+                    "tools": ["do_thing"],
+                }
+            ],
+        ):
+            doc = _render_mcp_services_doc()
+        assert "**future-service** (tools: `future_service_do_thing`)" in doc
+        # No description prose appended for unknown services.
+        assert "connects to" not in doc
+
+    def test_render_falls_back_to_wildcard_when_tools_empty(self):
+        with patch.object(
+            agent_module,
+            "DISCOVERED_MCP_SERVERS",
+            [{"name": "future-service", "tool_name_prefix": "future_service", "tools": []}],
+        ):
+            doc = _render_mcp_services_doc()
+        assert "**future-service** (tools prefixed `future_service_*`)" in doc
+
+    def test_render_handles_service_with_no_tools_field(self):
+        # An entry that has neither `tools` key set nor a populated list —
+        # `entry.get("tools") or []` must coerce both to the same fallback.
         with patch.object(
             agent_module,
             "DISCOVERED_MCP_SERVERS",
@@ -171,24 +220,35 @@ class TestInstructionRendering:
         ):
             doc = _render_mcp_services_doc()
         assert "**future-service** (tools prefixed `future_service_*`)" in doc
-        # No description prose appended for unknown services.
-        assert "connects to" not in doc
 
-    def test_built_agent_instruction_contains_live_prefixes(self):
+    def test_render_handles_service_with_no_prefix_and_no_tools(self):
+        with patch.object(
+            agent_module,
+            "DISCOVERED_MCP_SERVERS",
+            [{"name": "broken-service"}],
+        ):
+            doc = _render_mcp_services_doc()
+        assert "**broken-service** (no tools advertised)" in doc
+
+    def test_built_agent_instruction_contains_live_tool_names_and_guardrails(self):
         with (
             patch.object(agent_module, "_discover_mcp_toolsets", return_value=[]),
             patch.object(agent_module, "DISCOVERED_MCP_SERVERS", self._DISCOVERED),
         ):
             built = agent_module._build_agent()
         instruction = built.instruction
-        # New prefixes present.
-        assert "`legacy_dms_*`" in instruction
-        assert "`corporate_email_*`" in instruction
-        assert "`income_verification_*`" in instruction
-        # Stale hardcoded prefixes are gone.
-        assert "`dms_*`" not in instruction
-        assert "`email_*`" not in instruction
-        assert "`income_*`" not in instruction
+        # Concrete prefixed names present.
+        assert "`legacy_dms_search_documents`" in instruction
+        assert "`legacy_dms_get_document`" in instruction
+        assert "`income_verification_verify_income`" in instruction
+        # Wildcard form must NOT leak through when tools are known.
+        assert "`legacy_dms_*`" not in instruction
+        assert "`corporate_email_*`" not in instruction
+        assert "`income_verification_*`" not in instruction
+        # Anti-hallucination guardrails are in place.
+        assert "Only call tools by the exact names listed below." in instruction
+        assert "never use a colon (`:`)" in instruction
+        assert "Never invent tool names." in instruction
 
 
 class TestConnectionTimeoutNoMutation:
@@ -210,9 +270,20 @@ class TestConnectionTimeoutNoMutation:
 
         registry_instance = MagicMock()
         registry_instance.list_mcp_servers.return_value = {
-            "mcpServers": [{"name": "projects/p/locations/l/mcpServers/x", "displayName": "x"}]
+            "mcpServers": [
+                {
+                    "name": "projects/p/locations/l/mcpServers/x",
+                    "displayName": "x",
+                    "tools": [{"name": "do_thing"}],
+                }
+            ]
         }
         registry_instance.get_mcp_toolset.return_value = toolset
+
+        # Reset module-level cache so the discovery actually runs (other
+        # tests in this file may have populated it via real or mocked calls).
+        agent_module._CACHED_TOOLSETS = None
+        agent_module._CACHED_DISCOVERED = None
 
         with patch(
             "google.adk.integrations.agent_registry.AgentRegistry",
@@ -222,3 +293,7 @@ class TestConnectionTimeoutNoMutation:
 
         assert result == [toolset]
         assert conn_params.timeout == 5.0
+        # Unprefixed tool names from the registry payload land in
+        # DISCOVERED_MCP_SERVERS so the instruction renderer can enumerate
+        # exact names (preventing hallucination).
+        assert agent_module.DISCOVERED_MCP_SERVERS[0]["tools"] == ["do_thing"]
