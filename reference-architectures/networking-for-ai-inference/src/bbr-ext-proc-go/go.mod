@@ -2,7 +2,7 @@ module github.com/google/inference-gateway-demo/bbr-ext-proc
 
 go 1.24.0
 
-toolchain go1.26.4
+toolchain go1.26.5
 
 require (
 	github.com/envoyproxy/go-control-plane/envoy v1.37.0
